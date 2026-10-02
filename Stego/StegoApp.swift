@@ -6,16 +6,18 @@
 //
 
 import SwiftUI
-import CoreData
 
 @main
 struct StegoApp: App {
-    let persistenceController = PersistenceController.shared
-
+    
+    // Инициализатор срабатывает при запуске до отрисовки окон
+//    init() {
+////        SecurityTool.disableDebugging()
+//    }
+    
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environment(\.managedObjectContext, persistenceController.container.viewContext)
         }
     }
 }
