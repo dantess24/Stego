@@ -112,11 +112,9 @@ class StegoViewModel: ObservableObject {
 
 // MARK: - View (Интерфейс пользователя)
 struct ContentView: View {
-    @State private var sourceImage: NSImage?
-    @State private var textToHide: String = ""
-    @State private var processedImage: NSImage?
-    @State private var statusMessage: String = "Жду файлы..."
-
+    @StateObject private var viewModel = StegoViewModel()
+    @State private var isTargeted = false // Для анимации Drag-and-Drop
+    
     var body: some View {
         VStack(spacing: 20) {
             

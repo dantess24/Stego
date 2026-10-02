@@ -33,7 +33,7 @@ protocol StegoCodec {
     func extract(from image: CGImage) throws -> String
 }
 
-// MARK: - обработка изображения
+// MARK: - обработка изображения
 /// Класс отвечает исключительно за трансформацию CGImage в массив байтов и обратно
 class ImageProcessor {
     
@@ -46,7 +46,7 @@ class ImageProcessor {
     static func getPixelBuffer(from image: CGImage) throws -> PixelBuffer {
         let width = image.width
         let height = image.height
-        let bytesPerPixel = 4
+        let bytesPerPixel = 4 // RGBA
         let totalBytes = width * height * bytesPerPixel
         
         var rawBytes = [UInt8](repeating: 0, count: totalBytes)
@@ -100,31 +100,38 @@ class LSBEngine: StegoCodec {
     func embed(payload: String, into image: CGImage) throws -> CGImage {
         var buffer = try ImageProcessor.getPixelBuffer(from: image)
         
-        // Преобразуем строку в байты и добавляем нулевой байт как терминатор конца сообщения
         guard var payloadBytes = payload.data(using: .utf8).map({ [UInt8]($0) }) else {
             throw StegoError.encodingFailed
         }
         payloadBytes.append(0) // Терминатор \0
         
-        let requiredPixels = payloadBytes.count * 8
-        if requiredPixels > buffer.bytes.count {
-            throw StegoError.imageTooSmall(required: requiredPixels, available: buffer.bytes.count)
+        // Теперь нам доступно только 3 байта из 4 в каждом пикселе
+        let usableBytes = (buffer.bytes.count / 4) * 3
+        let requiredBits = payloadBytes.count * 8
+        
+        if requiredBits > usableBytes {
+            throw StegoError.imageTooSmall(required: requiredBits, available: usableBytes)
         }
         
         var byteIndex = 0
         var bitIndex = 0
         
-        // Проходим по байтам пикселей (R, G, B, A) и меняем младший бит
-        for i in 0 ..< requiredPixels {
-            let targetBit = (payloadBytes[byteIndex] >> (7 - bitIndex)) & 1
+        for i in 0..<buffer.bytes.count {
+            // Пропускаем Альфа-канал (каждый 4-й байт)
+            if (i + 1) % 4 == 0 { continue }
             
-            // Очищаем младший бит (сдвигаем маской 11111110) и записываем бит полезной нагрузки
+            let targetBit = (payloadBytes[byteIndex] >> (7 - bitIndex)) & 1
             buffer.bytes[i] = (buffer.bytes[i] & 0xFE) | targetBit
             
             bitIndex += 1
             if bitIndex == 8 {
                 bitIndex = 0
                 byteIndex += 1
+            }
+            
+            // Если записали все сообщение — выходим из цикла
+            if byteIndex >= payloadBytes.count {
+                break
             }
         }
         
@@ -138,18 +145,18 @@ class LSBEngine: StegoCodec {
         var currentByte: UInt8 = 0
         var bitIndex = 0
         
-        for pixelByte in buffer.bytes {
-            // Читаем младший бит
-            let extractedBit = pixelByte & 1
+        for i in 0..<buffer.bytes.count {
+            // Пропускаем Альфа-канал при чтении
+            if (i + 1) % 4 == 0 { continue }
+            
+            let extractedBit = buffer.bytes[i] & 1
             currentByte = (currentByte << 1) | extractedBit
             
             bitIndex += 1
             
-            // Собрали полный байт (8 бит)
             if bitIndex == 8 {
                 if currentByte == 0 {
-                    // Нашли терминатор \0 — конец сообщения
-                    break
+                    break // Нашли терминатор
                 }
                 extractedBytes.append(currentByte)
                 currentByte = 0
