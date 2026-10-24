@@ -9,15 +9,25 @@ import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
 import Combine
+import ImageIO
 
 // MARK: - ViewModel (Связующее звено)
+@MainActor
 class StegoViewModel: ObservableObject {
     @Published var inputImage: NSImage?
     @Published var outputCGImage: CGImage?
     @Published var secretText: String = ""
     @Published var statusMessage: String = "Перетащите картинку (PNG/BMP) или кликните для выбора"
+    @Published var isError = false
+    @Published var isProcessing = false
     
     private let engine = LSBEngine() // Инициализация ядра из файла StegoEngine.swift
+    private var inputCGImage: CGImage? // Исходные пиксели без пересчёта размера
+    
+    private func setStatus(_ message: String, isError: Bool = false) {
+        statusMessage = message
+        self.isError = isError
+    }
     
     // Открытие файла через системное окно Finder
     func selectImage() {
@@ -32,59 +42,66 @@ class StegoViewModel: ObservableObject {
     }
     
     func loadImage(from url: URL) {
-        if let image = NSImage(contentsOf: url) {
-            self.inputImage = image
-            self.outputCGImage = nil
-            self.secretText = ""
-            self.statusMessage = "Изображение загружено. Введите текст."
-        } else {
-            self.statusMessage = "Ошибка загрузки файла."
+        // CGImageSource отдаёт реальные пиксели файла (на Retina NSImage.size — в пунктах)
+        guard let image = NSImage(contentsOf: url),
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            setStatus("Ошибка загрузки файла.", isError: true)
+            return
         }
+        inputImage = image
+        inputCGImage = cgImage
+        outputCGImage = nil
+        secretText = ""
+        setStatus("Изображение загружено. Введите текст.")
     }
     
-    // Процесс сокрытия текста
+    // Процесс сокрытия текста (тяжёлая работа — вне главного потока)
     func embedText() {
-        guard let input = inputImage, !secretText.isEmpty else {
-            statusMessage = "Ошибка: нет картинки или пустое сообщение."
+        guard let cgImage = inputCGImage, !secretText.isEmpty else {
+            setStatus("Ошибка: нет картинки или пустое сообщение.", isError: true)
             return
         }
         
-        // Получаем CGImage из NSImage (стандартная процедура AppKit)
-        var rect = CGRect(x: 0, y: 0, width: input.size.width, height: input.size.height)
-        guard let cgImage = input.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
-            statusMessage = "Ошибка чтения пикселей изображения."
-            return
-        }
+        let engine = engine
+        let text = secretText
+        isProcessing = true
+        setStatus("Обработка…")
         
-        do {
-            let resultImage = try engine.embed(payload: secretText, into: cgImage)
-            self.outputCGImage = resultImage
-            self.statusMessage = "Текст успешно скрыт! Нажмите «Сохранить результат»."
-        } catch let error as StegoError {
-            self.statusMessage = "Ошибка: \(error.localizedDescription)"
-        } catch {
-            self.statusMessage = "Неизвестная ошибка: \(error.localizedDescription)"
+        Task {
+            let result = await Task.detached { Result { try engine.embed(payload: text, into: cgImage) } }.value
+            isProcessing = false
+            switch result {
+            case .success(let image):
+                outputCGImage = image
+                setStatus("Текст успешно скрыт! Нажмите «Сохранить результат».")
+            case .failure(let error):
+                setStatus("Ошибка: \(error.localizedDescription)", isError: true)
+            }
         }
     }
     
     // Процесс извлечения текста
     func extractText() {
-        guard let input = inputImage else {
-            statusMessage = "Ошибка: сначала загрузите картинку с секретом."
+        guard let cgImage = inputCGImage else {
+            setStatus("Ошибка: сначала загрузите картинку с секретом.", isError: true)
             return
         }
         
-        var rect = CGRect(x: 0, y: 0, width: input.size.width, height: input.size.height)
-        guard let cgImage = input.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
+        let engine = engine
+        isProcessing = true
+        setStatus("Обработка…")
         
-        do {
-            let extracted = try engine.extract(from: cgImage)
-            self.secretText = extracted
-            self.statusMessage = "Текст успешно извлечен!"
-        } catch let error as StegoError {
-            self.statusMessage = "Ошибка извлечения: \(error.localizedDescription)"
-        } catch {
-            self.statusMessage = "Неизвестная ошибка."
+        Task {
+            let result = await Task.detached { Result { try engine.extract(from: cgImage) } }.value
+            isProcessing = false
+            switch result {
+            case .success(let text):
+                secretText = text
+                setStatus("Текст успешно извлечен!")
+            case .failure(let error):
+                setStatus("Ошибка извлечения: \(error.localizedDescription)", isError: true)
+            }
         }
     }
     
@@ -96,16 +113,19 @@ class StegoViewModel: ObservableObject {
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = "stego_result.png"
         
-        if panel.runModal() == .OK, let url = panel.url {
-            let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
-            if let pngData = bitmapRep.representation(using: .png, properties: [:]) {
-                do {
-                    try pngData.write(to: url)
-                    statusMessage = "Файл успешно сохранен!"
-                } catch {
-                    statusMessage = "Ошибка при записи файла на диск."
-                }
-            }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        
+        // CGImageDestination пишет пиксели как есть, в том же sRGB-пространстве
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            setStatus("Ошибка при записи файла на диск.", isError: true)
+            return
+        }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        
+        if CGImageDestinationFinalize(destination) {
+            setStatus("Файл успешно сохранен!")
+        } else {
+            setStatus("Ошибка при записи файла на диск.", isError: true)
         }
     }
 }
@@ -168,7 +188,7 @@ struct ContentView: View {
             // Статусная строка
             Text(viewModel.statusMessage)
                 .font(.system(size: 13, weight: .medium))
-                .foregroundColor(viewModel.statusMessage.contains("Ошибка") ? .red : .green)
+                .foregroundColor(viewModel.isError ? .red : .green)
                 .frame(maxWidth: .infinity, alignment: .leading)
             
             // Поле для ввода/вывода секретного сообщения
@@ -185,12 +205,12 @@ struct ContentView: View {
                 Button("Скрыть текст") {
                     viewModel.embedText()
                 }
-                .disabled(viewModel.inputImage == nil || viewModel.secretText.isEmpty)
+                .disabled(viewModel.inputImage == nil || viewModel.secretText.isEmpty || viewModel.isProcessing)
                 
                 Button("Извлечь текст") {
                     viewModel.extractText()
                 }
-                .disabled(viewModel.inputImage == nil)
+                .disabled(viewModel.inputImage == nil || viewModel.isProcessing)
                 
                 Spacer()
                 
@@ -199,7 +219,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
-                .disabled(viewModel.outputCGImage == nil)
+                .disabled(viewModel.outputCGImage == nil || viewModel.isProcessing)
             }
         }
         .padding(24)
